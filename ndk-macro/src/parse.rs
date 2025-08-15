@@ -45,6 +45,7 @@ mod logger {
     #[derive(FromMeta, PartialEq, Eq, Debug, Clone, Copy)]
     #[darling(default)]
     pub enum LogLevel {
+        Off,
         Error,
         Warn,
         Info,

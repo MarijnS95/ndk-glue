@@ -37,7 +37,7 @@ mod logger {
                 withs.push(quote! { with_tag(#tag) });
             }
             if let Some(level) = &self.level {
-                withs.push(quote! { with_min_level(#glue_crate::log::Level::#level) });
+                withs.push(quote! { with_max_level(#glue_crate::log::LevelFilter::#level) });
             }
             if let Some(filter) = &self.filter {
                 withs.push(quote! {
@@ -59,6 +59,7 @@ mod logger {
             use LogLevel::*;
 
             tokens.extend(match self {
+                Off => quote! { Off },
                 Error => quote! { Error },
                 Warn => quote! { Warn },
                 Info => quote! { Info },
@@ -80,12 +81,9 @@ impl MainAttr {
         };
 
         #[cfg(feature = "logger")]
-        let preamble = preamble.chain(
-            self.logger
-                .as_ref()
-                .map(|l| l.expand(&glue_crate))
-                .into_iter(),
-        );
+        let preamble = preamble.chain(self.logger.as_ref().map(|l| l.expand(&glue_crate)));
+        #[cfg(not(feature = "logger"))]
+        assert!(self.logger.is_empty());
 
         quote! {
             #[no_mangle]
@@ -257,7 +255,7 @@ mod test {
         }
 
         #[test]
-        fn main_with_logger_with_min_level() {
+        fn main_with_logger_with_max_level() {
             let attr = MainAttr {
                 logger: Some(LoggerProp {
                     level: Some(LogLevel::Debug),
@@ -276,7 +274,7 @@ mod test {
                 ) {
                     ndk_glue::android_logger::init_once(
                         ndk_glue::android_logger::Config::default()
-                            .with_min_level(ndk_glue::log::Level::Debug)
+                            .with_max_level(ndk_glue::log::Level::Debug)
                     );
                     ndk_glue::init(
                         activity as _,
@@ -359,7 +357,7 @@ mod test {
         }
 
         #[test]
-        fn main_with_logger_with_min_level_and_with_tag() {
+        fn main_with_logger_with_max_level_and_with_tag() {
             let attr = MainAttr {
                 logger: Some(LoggerProp {
                     level: Some(LogLevel::Warn),
@@ -380,7 +378,7 @@ mod test {
                     ndk_glue::android_logger::init_once(
                         ndk_glue::android_logger::Config::default()
                             .with_tag("my-tag")
-                            .with_min_level(ndk_glue::log::Level::Warn)
+                            .with_max_level(ndk_glue::log::Level::Warn)
                     );
                     ndk_glue::init(
                         activity as _,
@@ -486,7 +484,7 @@ mod test {
                 ) {
                     my::re::exported::ndk_glue::android_logger::init_once(
                         my::re::exported::ndk_glue::android_logger::Config::default()
-                            .with_min_level(my::re::exported::ndk_glue::log::Level::Trace)
+                            .with_max_level(my::re::exported::ndk_glue::log::Level::Trace)
                     );
                     my::re::exported::ndk_glue::init(
                         activity as _,

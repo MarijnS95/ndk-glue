@@ -6,7 +6,6 @@ use ndk::looper::{FdEvent, ForeignLooper, ThreadLooper};
 use ndk::native_activity::NativeActivity;
 use ndk::native_window::NativeWindow;
 use ndk_sys::{AInputQueue, ANativeActivity, ANativeWindow, ARect};
-use once_cell::sync::Lazy;
 use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
 use std::ffi::{CStr, CString};
 use std::fmt;
@@ -16,7 +15,7 @@ use std::ops::Deref;
 use std::os::raw;
 use std::os::unix::prelude::*;
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::thread;
 
 #[cfg(feature = "logger")]
@@ -51,11 +50,11 @@ pub fn android_log(level: Level, tag: &CStr, msg: &CStr) {
     }
 }
 
-static NATIVE_ACTIVITY: Lazy<RwLock<Option<NativeActivity>>> = Lazy::new(Default::default);
-static NATIVE_WINDOW: Lazy<RwLock<Option<NativeWindow>>> = Lazy::new(Default::default);
-static INPUT_QUEUE: Lazy<RwLock<Option<InputQueue>>> = Lazy::new(Default::default);
-static CONTENT_RECT: Lazy<RwLock<Rect>> = Lazy::new(Default::default);
-static LOOPER: Lazy<Mutex<Option<ForeignLooper>>> = Lazy::new(Default::default);
+static NATIVE_ACTIVITY: RwLock<Option<NativeActivity>> = RwLock::new(None);
+static NATIVE_WINDOW: RwLock<Option<NativeWindow>> = RwLock::new(None);
+static INPUT_QUEUE: RwLock<Option<InputQueue>> = RwLock::new(None);
+static CONTENT_RECT: RwLock<Rect> = RwLock::new(Rect::empty());
+static LOOPER: Mutex<Option<ForeignLooper>> = Mutex::new(None);
 
 /// This function accesses a `static` variable internally and must only be used if you are sure
 /// there is exactly one version of [`ndk_glue`][crate] in your dependency tree.
@@ -140,18 +139,15 @@ pub fn content_rect() -> Rect {
     CONTENT_RECT.read().clone()
 }
 
-static PIPE: Lazy<[RawFd; 2]> = Lazy::new(|| {
-    let mut pipe: [RawFd; 2] = Default::default();
-    unsafe { libc::pipe(pipe.as_mut_ptr()) };
-    pipe
-});
+static PIPE: LazyLock<(OwnedFd, OwnedFd)> = LazyLock::new(|| rustix::pipe::pipe().unwrap());
 
 pub fn poll_events() -> Option<Event> {
     unsafe {
         let size = std::mem::size_of::<Event>();
-        let mut event = Event::Start;
-        if libc::read(PIPE[0], &mut event as *mut _ as *mut _, size) == size as _ {
-            Some(event)
+        let mut event = !0u8;
+        if rustix::io::read(&PIPE.0, std::slice::from_mut(&mut event)).unwrap() == size as _ {
+            // Some(event as Event)
+            Some(std::mem::transmute::<u8, Event>(event))
         } else {
             None
         }
@@ -159,9 +155,12 @@ pub fn poll_events() -> Option<Event> {
 }
 
 unsafe fn wake(_activity: *mut ANativeActivity, event: Event) {
-    log::trace!("{:?}", event);
+    log::trace!("Wake: {:?}", event);
     let size = std::mem::size_of::<Event>();
-    let res = libc::write(PIPE[1], &event as *const _ as *const _, size);
+
+    let event = event as u8;
+
+    let res = rustix::io::write(&PIPE.1, std::slice::from_ref(&event)).unwrap();
     assert_eq!(res, size as _);
 }
 
@@ -171,6 +170,17 @@ pub struct Rect {
     pub top: u32,
     pub right: u32,
     pub bottom: u32,
+}
+
+impl Rect {
+    pub const fn empty() -> Self {
+        Self {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -233,7 +243,7 @@ pub unsafe fn init(
     main: fn(),
 ) {
     let mut activity = NonNull::new(activity).unwrap();
-    let mut callbacks = activity.as_mut().callbacks.as_mut().unwrap();
+    let callbacks = activity.as_mut().callbacks.as_mut().unwrap();
     callbacks.onStart = Some(on_start);
     callbacks.onResume = Some(on_resume);
     callbacks.onSaveInstanceState = Some(on_save_instance_state);
@@ -255,23 +265,25 @@ pub unsafe fn init(
     ndk_context::initialize_android_context(activity.vm().cast(), activity.activity().cast());
     NATIVE_ACTIVITY.write().replace(activity);
 
-    let mut logpipe: [RawFd; 2] = Default::default();
-    libc::pipe(logpipe.as_mut_ptr());
-    libc::dup2(logpipe[1], libc::STDOUT_FILENO);
-    libc::dup2(logpipe[1], libc::STDERR_FILENO);
-    thread::spawn(move || {
-        let tag = CStr::from_bytes_with_nul(b"RustStdoutStderr\0").unwrap();
-        let file = File::from_raw_fd(logpipe[0]);
+    let file = {
+        let (read, write) = rustix::pipe::pipe().unwrap();
+        rustix::stdio::dup2_stdout(&write).unwrap();
+        rustix::stdio::dup2_stderr(&write).unwrap();
+
+        File::from(read)
+    };
+
+    thread::spawn(move || -> std::io::Result<()> {
         let mut reader = BufReader::new(file);
         let mut buffer = String::new();
         loop {
             buffer.clear();
-            if let Ok(len) = reader.read_line(&mut buffer) {
-                if len == 0 {
-                    break;
-                } else if let Ok(msg) = CString::new(buffer.clone()) {
-                    android_log(Level::Info, tag, &msg);
-                }
+            let len = reader.read_line(&mut buffer)?;
+            if len == 0 {
+                break Ok(());
+            } else if let Ok(msg) = CString::new(buffer.clone()) {
+                android_log(Level::Info, c"RustStdoutStderr", &msg);
+                // log::info!(target: "RustStdoutStderr", "{buffer}");
             }
         }
     });
@@ -284,7 +296,9 @@ pub unsafe fn init(
         let foreign = looper.into_foreign();
         foreign
             .add_fd(
-                PIPE[0],
+                // TODO: Take impl AsFd.
+                PIPE.0.as_fd(),
+                // &PIPE.0,
                 NDK_GLUE_LOOPER_EVENT_PIPE_IDENT,
                 FdEvent::INPUT,
                 std::ptr::null_mut(),
@@ -320,7 +334,7 @@ unsafe extern "C" fn on_resume(activity: *mut ANativeActivity) {
 
 unsafe extern "C" fn on_save_instance_state(
     activity: *mut ANativeActivity,
-    _out_size: *mut ndk_sys::size_t,
+    _out_size: *mut usize,
 ) -> *mut raw::c_void {
     // TODO
     wake(activity, Event::SaveInstanceState);

@@ -2,7 +2,7 @@
 name = "ndk-macro"
 version = "0.3.0"
 authors = ["The Rust Windowing contributors"]
-edition = "2018"
+edition = "2021"
 description = "Helper macros for android ndk"
 license = "MIT OR Apache-2.0"
 keywords = ["android", "ndk"]
