@@ -6,7 +6,9 @@ use ndk::looper::{FdEvent, ForeignLooper, ThreadLooper};
 use ndk::native_activity::NativeActivity;
 use ndk::native_window::NativeWindow;
 use ndk_sys::{AInputQueue, ANativeActivity, ANativeWindow, ARect};
-use parking_lot::{MappedRwLockReadGuard, RwLock, RwLockReadGuard};
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::File;
@@ -15,7 +17,7 @@ use std::ops::Deref;
 use std::os::raw;
 use std::os::unix::prelude::*;
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::thread;
 
 #[cfg(feature = "logger")]
@@ -50,20 +52,54 @@ pub fn android_log(level: Level, tag: &CStr, msg: &CStr) {
     }
 }
 
-static NATIVE_ACTIVITY: RwLock<Option<NativeActivity>> = RwLock::new(None);
-static NATIVE_WINDOW: RwLock<Option<NativeWindow>> = RwLock::new(None);
-static INPUT_QUEUE: RwLock<Option<InputQueue>> = RwLock::new(None);
-static CONTENT_RECT: RwLock<Rect> = RwLock::new(Rect::empty());
+pub struct ActivityState {
+    pub activity: NativeActivity,
+    pub root_window: Option<NativeWindow>,
+    pub input_queue: Option<InputQueue>,
+    pub content_rect: Rect,
+}
+
+static NATIVE_ACTIVITIES: RwLock<Vec<ActivityState>> = RwLock::new(vec![]);
+
+// static NATIVE_ACTIVITY: RwLock<Option<NativeActivity>> = RwLock::new(None);
+// static NATIVE_WINDOW: RwLock<Option<NativeWindow>> = RwLock::new(None);
+// static INPUT_QUEUE: RwLock<Option<InputQueue>> = RwLock::new(None);
+// static CONTENT_RECT: RwLock<Rect> = RwLock::new(Rect::empty());
+// We share one looper and one thread for all activities.
+// TODO: ForeignLooper is Send/Sync. Does not need to be in a Mutex, except for initial state assignment?
+// If so, this static should be shared by all activities
 static LOOPER: Mutex<Option<ForeignLooper>> = Mutex::new(None);
 
-/// This function accesses a `static` variable internally and must only be used if you are sure
-/// there is exactly one version of [`ndk_glue`][crate] in your dependency tree.
-///
-/// If you need access to the `JavaVM` through [`NativeActivity::vm()`] or Activity `Context`
-/// through [`NativeActivity::activity()`], please use the [`ndk_context`] crate and its
-/// [`ndk_context::android_context()`] getter to acquire the `JavaVM` and `Context` instead.
-pub fn native_activity() -> Option<LockReadGuard<NativeActivity>> {
-    LockReadGuard::from_wrapped_option(NATIVE_ACTIVITY.read())
+// /// This function accesses a `static` variable internally and must only be used if you are sure
+// /// there is exactly one version of [`ndk_glue`][crate] in your dependency tree.
+// ///
+// /// If you need access to the `JavaVM` through [`NativeActivity::vm()`] or Activity `Context`
+// /// through [`NativeActivity::activity()`], please use the [`ndk_context`] crate and its
+// /// [`ndk_context::android_context()`] getter to acquire the `JavaVM` and `Context` instead.
+// pub fn native_activity() -> Option<LockReadGuard<NativeActivity>> {
+//     LockReadGuard::from_wrapped_option(NATIVE_ACTIVITY.read())
+// }
+
+pub fn activities() -> RwLockReadGuard<'static, Vec<ActivityState>> {
+    // XXX: Don't let the user read?
+    NATIVE_ACTIVITIES.read()
+}
+
+pub fn activity_state_mut(
+    activity: *mut ANativeActivity,
+) -> Option<MappedRwLockWriteGuard<'static, ActivityState>> {
+    let activities = NATIVE_ACTIVITIES.write();
+    RwLockWriteGuard::try_map(activities, |a: &mut Vec<ActivityState>| {
+        a.iter_mut().find(|a| a.activity.ptr().as_ptr() == activity)
+    })
+    .ok()
+}
+
+pub fn activity_state_by_index_mut(
+    idx: usize,
+) -> Option<MappedRwLockWriteGuard<'static, ActivityState>> {
+    let activities = NATIVE_ACTIVITIES.write();
+    RwLockWriteGuard::try_map(activities, |a: &mut Vec<ActivityState>| a.get_mut(idx)).ok()
 }
 
 pub struct LockReadGuard<T: ?Sized + 'static>(MappedRwLockReadGuard<'static, T>);
@@ -101,67 +137,74 @@ impl<T: ?Sized + fmt::Display> fmt::Display for LockReadGuard<T> {
     }
 }
 
-/// Returns a [`NativeWindow`] held inside a lock, preventing Android from freeing it immediately
-/// in [its `NativeWindow` destructor].
-///
-/// If the window is in use by e.g. a graphics API, make sure to hold on to this lock.
-///
-/// After receiving [`Event::WindowDestroyed`] `ndk-glue` will block in Android's [`NativeWindow`] destructor
-/// callback until the lock is released, returning to Android and allowing it to free the window.
-///
-/// [its `NativeWindow` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#onnativewindowdestroyed
-///
-/// # Warning
-/// This function accesses a `static` variable internally and must only be used if you are sure
-/// there is exactly one version of `ndk_glue` in your dependency tree.
-pub fn native_window() -> Option<LockReadGuard<NativeWindow>> {
-    LockReadGuard::from_wrapped_option(NATIVE_WINDOW.read())
-}
+// /// Returns a [`NativeWindow`] held inside a lock, preventing Android from freeing it immediately
+// /// in [its `NativeWindow` destructor].
+// ///
+// /// If the window is in use by e.g. a graphics API, make sure to hold on to this lock.
+// ///
+// /// After receiving [`Event::WindowDestroyed`] `ndk-glue` will block in Android's [`NativeWindow`] destructor
+// /// callback until the lock is released, returning to Android and allowing it to free the window.
+// ///
+// /// [its `NativeWindow` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#onnativewindowdestroyed
+// ///
+// /// # Warning
+// /// This function accesses a `static` variable internally and must only be used if you are sure
+// /// there is exactly one version of `ndk_glue` in your dependency tree.
+// pub fn native_window() -> Option<LockReadGuard<NativeWindow>> {
+//     LockReadGuard::from_wrapped_option(NATIVE_WINDOW.read())
+// }
 
-/// Returns an [`InputQueue`] held inside a lock, preventing Android from freeing it immediately
-/// in [its `InputQueue` destructor].
-///
-/// After receiving [`Event::InputQueueDestroyed`] `ndk-glue` will block in Android's [`InputQueue`] destructor
-/// callback until the lock is released, returning to Android and allowing it to free the window.
-///
-/// [its `InputQueue` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#oninputqueuedestroyed
-///
-/// # Warning
-/// This function accesses a `static` variable internally and must only be used if you are sure
-/// there is exactly one version of `ndk_glue` in your dependency tree.
-pub fn input_queue() -> Option<LockReadGuard<InputQueue>> {
-    LockReadGuard::from_wrapped_option(INPUT_QUEUE.read())
-}
+// /// Returns an [`InputQueue`] held inside a lock, preventing Android from freeing it immediately
+// /// in [its `InputQueue` destructor].
+// ///
+// /// After receiving [`Event::InputQueueDestroyed`] `ndk-glue` will block in Android's [`InputQueue`] destructor
+// /// callback until the lock is released, returning to Android and allowing it to free the window.
+// ///
+// /// [its `InputQueue` destructor]: https://developer.android.com/ndk/reference/struct/a-native-activity-callbacks#oninputqueuedestroyed
+// ///
+// /// # Warning
+// /// This function accesses a `static` variable internally and must only be used if you are sure
+// /// there is exactly one version of `ndk_glue` in your dependency tree.
+// pub fn input_queue() -> Option<LockReadGuard<InputQueue>> {
+//     LockReadGuard::from_wrapped_option(INPUT_QUEUE.read())
+// }
 
-/// This function accesses a `static` variable internally and must only be used if you are sure
-/// there is exactly one version of `ndk_glue` in your dependency tree.
-pub fn content_rect() -> Rect {
-    CONTENT_RECT.read().clone()
-}
+// /// This function accesses a `static` variable internally and must only be used if you are sure
+// /// there is exactly one version of `ndk_glue` in your dependency tree.
+// pub fn content_rect() -> Rect {
+//     CONTENT_RECT.read().clone()
+// }
 
 static PIPE: LazyLock<(OwnedFd, OwnedFd)> = LazyLock::new(|| rustix::pipe::pipe().unwrap());
 
-pub fn poll_events() -> Option<Event> {
+pub fn poll_events() -> Option<(*mut ANativeActivity, Event)> {
     unsafe {
-        let size = std::mem::size_of::<Event>();
-        let mut event = !0u8;
-        if rustix::io::read(&PIPE.0, std::slice::from_mut(&mut event)).unwrap() == size as _ {
-            // Some(event as Event)
-            Some(std::mem::transmute::<u8, Event>(event))
-        } else {
-            None
-        }
+        let mut event = [0u8];
+        let res = rustix::io::read(&PIPE.0, &mut event).unwrap();
+        assert_eq!(res, event.len());
+        let mut activity = 0usize.to_le_bytes();
+        let res = rustix::io::read(&PIPE.0, &mut activity).unwrap();
+        assert_eq!(res, activity.len());
+        // {
+        Some((
+            usize::from_le_bytes(activity) as *mut ANativeActivity,
+            std::mem::transmute::<u8, Event>(event[0]),
+        ))
+        // } else {
+        //     None
+        // }
     }
 }
 
-unsafe fn wake(_activity: *mut ANativeActivity, event: Event) {
-    log::trace!("Wake: {:?}", event);
-    let size = std::mem::size_of::<Event>();
+unsafe fn wake(activity: *mut ANativeActivity, event: Event) {
+    log::trace!("Wake {activity:p} {event:?}");
 
-    let event = event as u8;
-
-    let res = rustix::io::write(&PIPE.1, std::slice::from_ref(&event)).unwrap();
-    assert_eq!(res, size as _);
+    let event = [event as u8];
+    let res = rustix::io::write(&PIPE.1, &event).unwrap();
+    assert_eq!(res, event.len());
+    let activity = (activity as usize).to_le_bytes();
+    let res = rustix::io::write(&PIPE.1, &activity).unwrap();
+    assert_eq!(res, activity.len());
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -263,65 +306,82 @@ pub unsafe fn init(
 
     let activity = NativeActivity::from_ptr(activity);
     // ndk_context::initialize_android_context(activity.vm().cast(), activity.activity().cast());
-    NATIVE_ACTIVITY.write().replace(activity);
-
-    let file = {
-        let (read, write) = rustix::pipe::pipe().unwrap();
-        rustix::stdio::dup2_stdout(&write).unwrap();
-        rustix::stdio::dup2_stderr(&write).unwrap();
-
-        File::from(read)
-    };
-
-    thread::spawn(move || -> std::io::Result<()> {
-        let mut reader = BufReader::new(file);
-        let mut buffer = String::new();
-        loop {
-            buffer.clear();
-            let len = reader.read_line(&mut buffer)?;
-            if len == 0 {
-                break Ok(());
-            } else if let Ok(msg) = CString::new(buffer.clone()) {
-                android_log(Level::Info, c"RustStdoutStderr", &msg);
-                // log::info!(target: "RustStdoutStderr", "{buffer}");
-            }
-        }
+    NATIVE_ACTIVITIES.write().push(ActivityState {
+        activity,
+        root_window: None,
+        input_queue: None,
+        content_rect: Rect::empty(),
     });
 
-    let looper_ready = Arc::new(Condvar::new());
-    let signal_looper_ready = looper_ready.clone();
+    static LOG_FORWARDER: LazyLock<thread::JoinHandle<std::io::Result<()>>> = LazyLock::new(|| {
+        let file = {
+            let (read, write) = rustix::pipe::pipe().unwrap();
+            rustix::stdio::dup2_stdout(&write).unwrap();
+            rustix::stdio::dup2_stderr(&write).unwrap();
 
-    thread::spawn(move || {
-        let looper = ThreadLooper::prepare();
-        let foreign = looper.into_foreign();
-        foreign
-            .add_fd(
-                // TODO: Take impl AsFd.
-                PIPE.0.as_fd(),
-                // &PIPE.0,
-                NDK_GLUE_LOOPER_EVENT_PIPE_IDENT,
-                FdEvent::INPUT,
-                std::ptr::null_mut(),
-            )
+            File::from(read)
+        };
+
+        thread::spawn(move || -> std::io::Result<()> {
+            let mut reader = BufReader::new(file);
+            let mut buffer = String::new();
+            loop {
+                buffer.clear();
+                let len = reader.read_line(&mut buffer)?;
+                if len == 0 {
+                    break Ok(());
+                } else if let Ok(msg) = CString::new(buffer.clone()) {
+                    android_log(Level::Info, c"RustStdoutStderr", &msg);
+                    // log::info!(target: "RustStdoutStderr", "{buffer}");
+                }
+            }
+        })
+    });
+
+    static MAIN_THREAD: OnceLock<thread::JoinHandle<()>> = OnceLock::new();
+
+    MAIN_THREAD.get_or_init(move || {
+        let looper_ready = Arc::new(Condvar::new());
+        let signal_looper_ready = looper_ready.clone();
+
+        let jh = thread::spawn(move || {
+            let looper = ThreadLooper::prepare();
+            // TODO: Why didn't we Deref ThreadLooper into ForeignLooper? The latter is more restrictive.
+            let foreign = looper.into_foreign();
+            foreign
+                .add_fd(
+                    // TODO: Take impl AsFd.
+                    PIPE.0.as_fd(),
+                    // &PIPE.0,
+                    NDK_GLUE_LOOPER_EVENT_PIPE_IDENT,
+                    FdEvent::INPUT,
+                    std::ptr::null_mut(),
+                )
+                .unwrap();
+
+            {
+                let mut locked_looper = LOOPER.lock().unwrap();
+                let previous = locked_looper.replace(foreign);
+                assert!(previous.is_none(), "LazyLock is running twice?");
+                signal_looper_ready.notify_one();
+            }
+
+            // TODO: We won't call the users' main function more often. They just need to listen to the looper
+            // TODO: Give them the looper at least
+            main()
+        });
+
+        // Don't return from this function (`ANativeActivity_onCreate`) until the thread
+        // has created its `ThreadLooper` and assigned it to the static `LOOPER`
+        // variable. It will be used from `on_input_queue_created` as soon as this
+        // function returns.
+        let locked_looper = LOOPER.lock().unwrap();
+        let _mutex_guard = looper_ready
+            .wait_while(locked_looper, |looper| looper.is_none())
             .unwrap();
 
-        {
-            let mut locked_looper = LOOPER.lock().unwrap();
-            locked_looper.replace(foreign);
-            signal_looper_ready.notify_one();
-        }
-
-        main()
+        jh
     });
-
-    // Don't return from this function (`ANativeActivity_onCreate`) until the thread
-    // has created its `ThreadLooper` and assigned it to the static `LOOPER`
-    // variable. It will be used from `on_input_queue_created` as soon as this
-    // function returns.
-    let locked_looper = LOOPER.lock().unwrap();
-    let _mutex_guard = looper_ready
-        .wait_while(locked_looper, |looper| looper.is_none())
-        .unwrap();
 }
 
 unsafe extern "C" fn on_start(activity: *mut ANativeActivity) {
@@ -350,11 +410,15 @@ unsafe extern "C" fn on_stop(activity: *mut ANativeActivity) {
 }
 
 unsafe extern "C" fn on_destroy(activity: *mut ANativeActivity) {
+    log::error!("Destroyed {activity:?}");
     wake(activity, Event::Destroy);
     // ndk_context::release_android_context();
-    let mut native_activity_guard = NATIVE_ACTIVITY.write();
-    let native_activity = native_activity_guard.take().unwrap();
-    assert_eq!(native_activity.ptr().as_ptr(), activity);
+    let mut native_activity_guard = NATIVE_ACTIVITIES.write();
+    let idx = native_activity_guard
+        .iter()
+        .position(|a| a.activity.ptr().as_ptr() == activity)
+        .unwrap();
+    // let _deleted = native_activity_guard.swap_remove(idx);
 }
 
 unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
@@ -378,9 +442,11 @@ unsafe extern "C" fn on_window_focus_changed(
 }
 
 unsafe extern "C" fn on_window_created(activity: *mut ANativeActivity, window: *mut ANativeWindow) {
-    NATIVE_WINDOW
-        .write()
+    let mut state = activity_state_mut(activity).unwrap();
+    let previous = state
+        .root_window
         .replace(NativeWindow::clone_from_ptr(NonNull::new(window).unwrap()));
+    assert!(previous.is_none());
     wake(activity, Event::WindowCreated);
 }
 
@@ -403,9 +469,9 @@ unsafe extern "C" fn on_window_destroyed(
     window: *mut ANativeWindow,
 ) {
     wake(activity, Event::WindowDestroyed);
-    let mut native_window_guard = NATIVE_WINDOW.write();
-    assert_eq!(native_window_guard.as_ref().unwrap().ptr().as_ptr(), window);
-    native_window_guard.take();
+    let mut state = activity_state_mut(activity).unwrap();
+
+    assert_eq!(state.root_window.take().unwrap().ptr().as_ptr(), window);
 }
 
 unsafe extern "C" fn on_input_queue_created(
@@ -417,8 +483,19 @@ unsafe extern "C" fn on_input_queue_created(
     // The looper should always be `Some` after `fn init()` returns, unless
     // future code cleans it up and sets it back to `None` again.
     let looper = locked_looper.as_ref().expect("Looper does not exist");
-    input_queue.attach_looper(looper, NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT);
-    INPUT_QUEUE.write().replace(input_queue);
+
+    // TODO: This index will be invalidated when the activity closes...
+    let mut a = NATIVE_ACTIVITIES.write();
+    let idx = a
+        .iter()
+        .position(|a| a.activity.ptr().as_ptr() == activity)
+        .unwrap();
+    input_queue.attach_looper(looper, NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT + idx as i32);
+
+    // let mut state = activity_state_mut(activity).unwrap();
+    let state = &mut a[idx];
+    let previous = state.input_queue.replace(input_queue);
+    assert!(previous.is_none());
     wake(activity, Event::InputQueueCreated);
 }
 
@@ -427,8 +504,8 @@ unsafe extern "C" fn on_input_queue_destroyed(
     queue: *mut AInputQueue,
 ) {
     wake(activity, Event::InputQueueDestroyed);
-    let mut input_queue_guard = INPUT_QUEUE.write();
-    let input_queue = input_queue_guard.take().unwrap();
+    let mut state = activity_state_mut(activity).unwrap();
+    let input_queue = state.input_queue.take().unwrap();
     assert_eq!(input_queue.ptr().as_ptr(), queue);
     input_queue.detach_looper();
 }
@@ -440,6 +517,7 @@ unsafe extern "C" fn on_content_rect_changed(activity: *mut ANativeActivity, rec
         right: (*rect).right as _,
         bottom: (*rect).bottom as _,
     };
-    *CONTENT_RECT.write() = rect;
+    let mut state = activity_state_mut(activity).unwrap();
+    state.content_rect = rect;
     wake(activity, Event::ContentRectChanged);
 }
