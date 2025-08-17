@@ -262,7 +262,7 @@ pub unsafe fn init(
     callbacks.onLowMemory = Some(on_low_memory);
 
     let activity = NativeActivity::from_ptr(activity);
-    ndk_context::initialize_android_context(activity.vm().cast(), activity.activity().cast());
+    // ndk_context::initialize_android_context(activity.vm().cast(), activity.activity().cast());
     NATIVE_ACTIVITY.write().replace(activity);
 
     let file = {
@@ -351,7 +351,7 @@ unsafe extern "C" fn on_stop(activity: *mut ANativeActivity) {
 
 unsafe extern "C" fn on_destroy(activity: *mut ANativeActivity) {
     wake(activity, Event::Destroy);
-    ndk_context::release_android_context();
+    // ndk_context::release_android_context();
     let mut native_activity_guard = NATIVE_ACTIVITY.write();
     let native_activity = native_activity_guard.take().unwrap();
     assert_eq!(native_activity.ptr().as_ptr(), activity);
