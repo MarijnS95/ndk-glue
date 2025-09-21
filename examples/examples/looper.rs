@@ -51,10 +51,10 @@ fn our_main() {
                 events,
                 data,
             } => {
-                let idx = ident - NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT;
-                info!("IQ at index {idx:?}");
-                let state = ndk_glue::activity_state_by_index_mut(idx as usize).unwrap();
-                let iq = state.input_queue.as_ref().unwrap();
+                // let idx = ident - NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT;
+                // info!("IQ at index {idx:?}");
+                let state = ndk_glue::activity_state_by_input_queue_ident_mut(ident).unwrap();
+                let (iq, ident) = state.input_queue.as_ref().unwrap();
                 let e = dbg!(iq.event()).unwrap().unwrap();
                 dbg!(&e);
                 let launch = match &e {

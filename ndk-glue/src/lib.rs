@@ -17,6 +17,7 @@ use std::ops::Deref;
 use std::os::raw;
 use std::os::unix::prelude::*;
 use std::ptr::NonNull;
+use std::sync::atomic::AtomicI32;
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 use std::thread;
 
@@ -55,11 +56,12 @@ pub fn android_log(level: Level, tag: &CStr, msg: &CStr) {
 pub struct ActivityState {
     pub activity: NativeActivity,
     pub root_window: Option<NativeWindow>,
-    pub input_queue: Option<InputQueue>,
+    pub input_queue: Option<(InputQueue, i32)>,
     pub content_rect: Rect,
 }
 
 static NATIVE_ACTIVITIES: RwLock<Vec<ActivityState>> = RwLock::new(vec![]);
+static INPUT_QUEUE_IDENT: AtomicI32 = AtomicI32::new(NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT);
 
 // static NATIVE_ACTIVITY: RwLock<Option<NativeActivity>> = RwLock::new(None);
 // static NATIVE_WINDOW: RwLock<Option<NativeWindow>> = RwLock::new(None);
@@ -95,11 +97,15 @@ pub fn activity_state_mut(
     .ok()
 }
 
-pub fn activity_state_by_index_mut(
-    idx: usize,
+pub fn activity_state_by_input_queue_ident_mut(
+    ident: i32,
 ) -> Option<MappedRwLockWriteGuard<'static, ActivityState>> {
     let activities = NATIVE_ACTIVITIES.write();
-    RwLockWriteGuard::try_map(activities, |a: &mut Vec<ActivityState>| a.get_mut(idx)).ok()
+    RwLockWriteGuard::try_map(activities, |a: &mut Vec<ActivityState>| {
+        a.iter_mut()
+            .find(|a| a.input_queue.as_ref().is_some_and(|&(_, i)| i == ident))
+    })
+    .ok()
 }
 
 pub struct LockReadGuard<T: ?Sized + 'static>(MappedRwLockReadGuard<'static, T>);
@@ -418,7 +424,7 @@ unsafe extern "C" fn on_destroy(activity: *mut ANativeActivity) {
         .iter()
         .position(|a| a.activity.ptr().as_ptr() == activity)
         .unwrap();
-    // let _deleted = native_activity_guard.swap_remove(idx);
+    let _deleted = native_activity_guard.swap_remove(idx);
 }
 
 unsafe extern "C" fn on_configuration_changed(activity: *mut ANativeActivity) {
@@ -486,15 +492,12 @@ unsafe extern "C" fn on_input_queue_created(
 
     // TODO: This index will be invalidated when the activity closes...
     let mut a = NATIVE_ACTIVITIES.write();
-    let idx = a
-        .iter()
-        .position(|a| a.activity.ptr().as_ptr() == activity)
-        .unwrap();
-    input_queue.attach_looper(looper, NDK_GLUE_LOOPER_INPUT_QUEUE_IDENT + idx as i32);
+    let ident = INPUT_QUEUE_IDENT.fetch_add(1, std::sync::atomic::Ordering::Release);
+    input_queue.attach_looper(looper, ident);
 
-    // let mut state = activity_state_mut(activity).unwrap();
-    let state = &mut a[idx];
-    let previous = state.input_queue.replace(input_queue);
+    let mut state = activity_state_mut(activity).unwrap();
+    // let state = &mut a[idx];
+    let previous = state.input_queue.replace((input_queue, ident));
     assert!(previous.is_none());
     wake(activity, Event::InputQueueCreated);
 }
@@ -505,7 +508,7 @@ unsafe extern "C" fn on_input_queue_destroyed(
 ) {
     wake(activity, Event::InputQueueDestroyed);
     let mut state = activity_state_mut(activity).unwrap();
-    let input_queue = state.input_queue.take().unwrap();
+    let (input_queue, _ident) = state.input_queue.take().unwrap();
     assert_eq!(input_queue.ptr().as_ptr(), queue);
     input_queue.detach_looper();
 }
